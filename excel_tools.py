@@ -273,6 +273,7 @@ def format_cell(file_path: str, cell_address: str,
                 font_color: Optional[str] = None,
                 bg_color: Optional[str] = None,
                 horizontal_align: Optional[str] = None,
+                number_format: Optional[str] = None,
                 sheet_name: Optional[str] = None) -> dict:
     """セルの書式を設定する（色はHEX形式: 'FF0000' = 赤）"""
     try:
@@ -312,6 +313,10 @@ def format_cell(file_path: str, cell_address: str,
             if horizontal_align not in _VALID_ALIGN:
                 raise ValueError(f"horizontal_align は {_VALID_ALIGN} のいずれかを指定してください")
             cell.alignment = Alignment(horizontal=horizontal_align)
+
+        # 数値書式
+        if number_format is not None:
+            cell.number_format = number_format
 
         wb.save(os.path.abspath(file_path))
         return {
@@ -511,6 +516,7 @@ TOOLS = [
                 "font_color": {"type": "string", "description": "Font color as hex string, e.g. FF0000 for red"},
                 "bg_color": {"type": "string", "description": "Background fill color as hex string, e.g. FFFF00 for yellow"},
                 "horizontal_align": {"type": "string", "enum": ["left", "center", "right"], "description": "Horizontal alignment"},
+                "number_format": {"type": "string", "description": "Excel number format string, e.g. '#,##0' for integer with comma, '#,##0.00' for 2 decimal places, '0%' for percentage, '¥#,##0' for yen"},
                 "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
             },
             "required": ["file_path", "cell_address"]
