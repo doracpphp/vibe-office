@@ -21,6 +21,12 @@ _BASE_DIR = os.path.realpath(os.getcwd())
 _HEX_COLOR_RE = re.compile(r'^[0-9A-Fa-f]{6}$')
 
 
+def _reraise_if_fatal(e: Exception) -> None:
+    """KeyboardInterrupt / SystemExit は握りつぶさず再 raise する"""
+    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+        raise
+
+
 def _safe_path(file_path: str) -> str:
     """パストラバーサルを防ぐ。BASE_DIR 外のパスは拒否する。"""
     abs_path = os.path.realpath(os.path.join(_BASE_DIR, file_path))
@@ -511,6 +517,175 @@ def get_document_info(file_path: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def set_page_layout(file_path: str,
+                    orientation: Optional[str] = None,
+                    top_cm: Optional[float] = None,
+                    bottom_cm: Optional[float] = None,
+                    left_cm: Optional[float] = None,
+                    right_cm: Optional[float] = None) -> dict:
+    """ページの向き・余白を設定する（orientation: portrait / landscape）"""
+    try:
+        from docx.enum.section import WD_ORIENT
+        doc = _get_doc(file_path, create_if_missing=True)
+        section = doc.sections[0]
+
+        if orientation is not None:
+            if orientation.lower() in ("landscape", "横"):
+                if section.orientation != WD_ORIENT.LANDSCAPE:
+                    section.orientation = WD_ORIENT.LANDSCAPE
+                    section.page_width, section.page_height = section.page_height, section.page_width
+            elif orientation.lower() in ("portrait", "縦"):
+                if section.orientation != WD_ORIENT.PORTRAIT:
+                    section.orientation = WD_ORIENT.PORTRAIT
+                    section.page_width, section.page_height = section.page_height, section.page_width
+
+        if top_cm    is not None: section.top_margin    = Cm(top_cm)
+        if bottom_cm is not None: section.bottom_margin = Cm(bottom_cm)
+        if left_cm   is not None: section.left_margin   = Cm(left_cm)
+        if right_cm  is not None: section.right_margin  = Cm(right_cm)
+
+        _save(file_path)
+        return {"success": True, "message": "ページレイアウトを設定しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def add_page_break(file_path: str,
+                   paragraph_index: Optional[int] = None) -> dict:
+    """改ページを挿入する（paragraph_index 省略時は末尾）"""
+    try:
+        from docx.enum.text import WD_BREAK
+        doc = _get_doc(file_path, create_if_missing=True)
+
+        if paragraph_index is None:
+            para = doc.add_paragraph()
+            para.add_run().add_break(WD_BREAK.PAGE)
+            inserted_index = len(doc.paragraphs) - 1
+        else:
+            if paragraph_index < 0 or paragraph_index >= len(doc.paragraphs):
+                return {"success": False, "error": f"インデックス {paragraph_index} は範囲外です"}
+            ref_para = doc.paragraphs[paragraph_index]
+            new_para_elem = OxmlElement("w:p")
+            ref_para._p.addnext(new_para_elem)
+            inserted_index = paragraph_index + 1
+            doc.paragraphs[inserted_index].add_run().add_break(WD_BREAK.PAGE)
+
+        _save(file_path)
+        return {"success": True, "message": f"改ページをインデックス {inserted_index} に挿入しました",
+                "inserted_index": inserted_index}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def read_table(file_path: str, table_index: int) -> dict:
+    """既存テーブルの内容を詳細に読み取る"""
+    try:
+        doc = _get_doc(file_path)
+        if table_index < 0 or table_index >= len(doc.tables):
+            return {"success": False,
+                    "error": f"テーブルインデックス {table_index} は範囲外です（0〜{len(doc.tables)-1}）"}
+
+        table = doc.tables[table_index]
+        rows_data = [
+            [{"row": r_idx, "col": c_idx, "text": cell.text}
+             for c_idx, cell in enumerate(row.cells)]
+            for r_idx, row in enumerate(table.rows)
+        ]
+        return {
+            "success": True,
+            "table_index": table_index,
+            "row_count": len(table.rows),
+            "col_count": len(table.columns),
+            "rows": rows_data,
+        }
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def format_table(file_path: str, table_index: int,
+                 row: int, col: int,
+                 bold: Optional[bool] = None,
+                 italic: Optional[bool] = None,
+                 font_size: Optional[int] = None,
+                 font_color: Optional[str] = None,
+                 bg_color: Optional[str] = None,
+                 alignment: Optional[str] = None) -> dict:
+    """テーブルの特定セルに書式を適用する"""
+    try:
+        doc = _get_doc(file_path)
+        if table_index < 0 or table_index >= len(doc.tables):
+            return {"success": False, "error": f"テーブルインデックス {table_index} は範囲外です"}
+
+        table = doc.tables[table_index]
+        if row < 0 or row >= len(table.rows):
+            return {"success": False, "error": f"行インデックス {row} は範囲外です（0〜{len(table.rows)-1}）"}
+        if col < 0 or col >= len(table.columns):
+            return {"success": False, "error": f"列インデックス {col} は範囲外です（0〜{len(table.columns)-1}）"}
+
+        cell = table.rows[row].cells[col]
+        align_map = {
+            "left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
+            "right": WD_ALIGN_PARAGRAPH.RIGHT, "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+        }
+
+        for para in cell.paragraphs:
+            if alignment and alignment.lower() in align_map:
+                para.alignment = align_map[alignment.lower()]
+            for run in para.runs:
+                if bold      is not None: run.bold   = bold
+                if italic    is not None: run.italic = italic
+                if font_size is not None: run.font.size = Pt(font_size)
+                if font_color is not None:
+                    hc = _validate_hex_color(font_color, "font_color")
+                    run.font.color.rgb = RGBColor(int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16))
+
+        if bg_color is not None:
+            hc = _validate_hex_color(bg_color, "bg_color")
+            tcPr = cell._tc.get_or_add_tcPr()
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:fill"), hc)
+            tcPr.append(shd)
+
+        _save(file_path)
+        return {"success": True, "message": f"テーブル {table_index} の [{row}][{col}] に書式を適用しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def add_header_footer(file_path: str,
+                      header_text: Optional[str] = None,
+                      footer_text: Optional[str] = None) -> dict:
+    """ヘッダー・フッターを設定する"""
+    try:
+        doc = _get_doc(file_path, create_if_missing=True)
+        section = doc.sections[0]
+
+        if header_text is not None:
+            header = section.header
+            para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+            para.text = header_text
+
+        if footer_text is not None:
+            footer = section.footer
+            para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+            para.text = footer_text
+
+        _save(file_path)
+        parts = []
+        if header_text is not None: parts.append(f"ヘッダー「{header_text}」")
+        if footer_text is not None: parts.append(f"フッター「{footer_text}」")
+        return {"success": True, "message": f"{' / '.join(parts)} を設定しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
 # ── ツール定義（Claude API用）──────────────────────────────────────────────
 
 TOOLS = [
@@ -697,6 +872,79 @@ TOOLS = [
         }
     },
     {
+        "name": "set_page_layout",
+        "description": "Set page orientation (portrait/landscape) and margins.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Word file"},
+                "orientation": {"type": "string", "enum": ["portrait", "landscape"], "description": "Page orientation"},
+                "top_cm":    {"type": "number", "description": "Top margin in cm"},
+                "bottom_cm": {"type": "number", "description": "Bottom margin in cm"},
+                "left_cm":   {"type": "number", "description": "Left margin in cm"},
+                "right_cm":  {"type": "number", "description": "Right margin in cm"}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "add_page_break",
+        "description": "Insert a page break after a paragraph index, or at the end if omitted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Word file"},
+                "paragraph_index": {"type": "integer", "description": "Insert after this paragraph index (default: append at end)"}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "read_table",
+        "description": "Read the contents of an existing table by index.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path":    {"type": "string",  "description": "Path to the Word file"},
+                "table_index":  {"type": "integer", "description": "Table index (0-based)"}
+            },
+            "required": ["file_path", "table_index"]
+        }
+    },
+    {
+        "name": "format_table",
+        "description": "Apply formatting to a specific cell in an existing table.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path":    {"type": "string",  "description": "Path to the Word file"},
+                "table_index":  {"type": "integer", "description": "Table index (0-based)"},
+                "row":          {"type": "integer", "description": "Row index (0-based)"},
+                "col":          {"type": "integer", "description": "Column index (0-based)"},
+                "bold":         {"type": "boolean"},
+                "italic":       {"type": "boolean"},
+                "font_size":    {"type": "integer", "description": "Font size in pt"},
+                "font_color":   {"type": "string",  "description": "Font color as hex, e.g. FF0000"},
+                "bg_color":     {"type": "string",  "description": "Background color as hex, e.g. FFFF00"},
+                "alignment":    {"type": "string",  "enum": ["left", "center", "right", "justify"]}
+            },
+            "required": ["file_path", "table_index", "row", "col"]
+        }
+    },
+    {
+        "name": "add_header_footer",
+        "description": "Set the header and/or footer text for the document.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path":    {"type": "string", "description": "Path to the Word file"},
+                "header_text":  {"type": "string", "description": "Header text (omit to leave unchanged)"},
+                "footer_text":  {"type": "string", "description": "Footer text (omit to leave unchanged)"}
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
         "name": "append_rich_paragraph",
         "description": (
             "Append a paragraph built from a list of runs with individual bold/italic formatting. "
@@ -745,6 +993,11 @@ TOOL_FUNCTIONS = {
     "add_heading": add_heading,
     "save_word": save_word,
     "get_document_info": get_document_info,
+    "set_page_layout": set_page_layout,
+    "add_page_break": add_page_break,
+    "read_table": read_table,
+    "format_table": format_table,
+    "add_header_footer": add_header_footer,
 }
 
 

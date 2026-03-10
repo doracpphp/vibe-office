@@ -376,6 +376,174 @@ def get_sheet_info(file_path: str, sheet_name: Optional[str] = None) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def format_range(file_path: str, cell_range: str,
+                 bold: Optional[bool] = None,
+                 italic: Optional[bool] = None,
+                 font_size: Optional[int] = None,
+                 font_color: Optional[str] = None,
+                 bg_color: Optional[str] = None,
+                 horizontal_align: Optional[str] = None,
+                 number_format: Optional[str] = None,
+                 sheet_name: Optional[str] = None) -> dict:
+    """セル範囲に書式を一括適用する（例: cell_range='A1:D1'）"""
+    try:
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        validated_font_color = _validate_hex_color(font_color, "font_color") if font_color else None
+        validated_bg_color   = _validate_hex_color(bg_color,   "bg_color")   if bg_color   else None
+
+        if horizontal_align and horizontal_align not in _VALID_ALIGN:
+            raise ValueError(f"horizontal_align は {_VALID_ALIGN} のいずれかを指定してください")
+
+        cells_updated = 0
+        for row in ws[cell_range]:
+            for cell in (row if hasattr(row, "__iter__") else [row]):
+                if any(v is not None for v in [bold, italic, font_size, validated_font_color]):
+                    existing = cell.font
+                    cell.font = Font(
+                        bold=bold if bold is not None else existing.bold,
+                        italic=italic if italic is not None else existing.italic,
+                        size=font_size if font_size is not None else existing.size,
+                        color=validated_font_color if validated_font_color else (
+                            existing.color.rgb if existing.color and existing.color.type == "rgb" else "000000"
+                        ),
+                    )
+                if validated_bg_color is not None:
+                    cell.fill = PatternFill(fill_type="solid", fgColor=validated_bg_color)
+                if horizontal_align is not None:
+                    cell.alignment = Alignment(horizontal=horizontal_align)
+                if number_format is not None:
+                    cell.number_format = number_format
+                cells_updated += 1
+
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"{cell_range} の {cells_updated} セルに書式を適用しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def merge_cells(file_path: str, cell_range: str,
+                unmerge: bool = False,
+                sheet_name: Optional[str] = None) -> dict:
+    """セルを結合または解除する（例: cell_range='A1:D1'）"""
+    try:
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        if unmerge:
+            ws.unmerge_cells(cell_range)
+            action = "解除"
+        else:
+            ws.merge_cells(cell_range)
+            action = "結合"
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"{cell_range} のセルを{action}しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def add_chart(file_path: str, chart_type: str,
+              data_range: str,
+              title: Optional[str] = None,
+              position: str = "E5",
+              sheet_name: Optional[str] = None) -> dict:
+    """グラフを追加する（chart_type: bar / line / pie）
+    data_range の先頭列をカテゴリラベル、2列目以降を数値データとして扱う。
+    先頭行はヘッダーとして扱われる。
+    例: data_range='A1:B6'（A列=カテゴリ, B列=値, 1行目=ヘッダー）
+    """
+    try:
+        from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        cells = list(ws[data_range])
+        if not cells:
+            return {"success": False, "error": f"データ範囲 {data_range} が空です"}
+
+        min_row = cells[0][0].row
+        max_row = cells[-1][0].row
+        min_col = cells[0][0].column
+        max_col = cells[0][-1].column
+
+        ct = chart_type.lower()
+        if ct in ("bar", "棒"):
+            chart = BarChart()
+        elif ct in ("line", "折れ線"):
+            chart = LineChart()
+        elif ct in ("pie", "円"):
+            chart = PieChart()
+        else:
+            return {"success": False, "error": f"未対応のグラフタイプ: {chart_type}。bar / line / pie を指定してください"}
+
+        # 数値データ列（2列目以降）を参照。先頭行をシリーズ名として使用
+        data_ref = Reference(ws,
+                             min_col=min_col + 1, max_col=max_col,
+                             min_row=min_row, max_row=max_row)
+        chart.add_data(data_ref, titles_from_data=True)
+
+        # 先頭列（カテゴリラベル）をX軸に設定。ヘッダー行は除く
+        cats_ref = Reference(ws,
+                             min_col=min_col,
+                             min_row=min_row + 1, max_row=max_row)
+        chart.set_categories(cats_ref)
+
+        if title:
+            chart.title = title
+
+        ws.add_chart(chart, position.upper())
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"{chart_type} グラフを {position.upper()} に追加しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def freeze_panes(file_path: str, cell: str,
+                 sheet_name: Optional[str] = None) -> dict:
+    """行・列を固定する（例: 'A2' で1行目を固定、'B2' で1行目+A列を固定）"""
+    try:
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        ws.freeze_panes = cell.upper()
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"ウィンドウ枠を {cell.upper()} で固定しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def set_row_height(file_path: str, row: int, height: float,
+                   sheet_name: Optional[str] = None) -> dict:
+    """行の高さを設定する"""
+    try:
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        ws.row_dimensions[row].height = height
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"行 {row} の高さを {height} に設定しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
+def add_filter(file_path: str, cell_range: str,
+               sheet_name: Optional[str] = None) -> dict:
+    """オートフィルターを設定する（例: cell_range='A1:E1'）"""
+    try:
+        wb = _get_workbook(file_path)
+        ws = wb[sheet_name] if sheet_name else wb.active
+        ws.auto_filter.ref = cell_range
+        wb.save(os.path.abspath(file_path))
+        return {"success": True, "message": f"{cell_range} にオートフィルターを設定しました"}
+    except Exception as e:
+        _reraise_if_fatal(e)
+        return {"success": False, "error": str(e)}
+
+
 # ── ツール定義（Claude API用）──────────────────────────────────────────────
 
 TOOLS = [
@@ -404,14 +572,20 @@ TOOLS = [
     },
     {
         "name": "read_sheet",
-        "description": "Read the contents of a sheet. Optionally limit to a row/column range.",
+        "description": (
+            "Read the contents of a sheet. "
+            "For large sheets (100+ rows), always read in chunks using min_row/max_row "
+            "to avoid exceeding context limits. "
+            "Example: first call with min_row=1, max_row=50, then min_row=51, max_row=100, and so on. "
+            "Use get_sheet_info first to know the total row count."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Path to the Excel file"},
                 "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"},
-                "min_row": {"type": "integer", "description": "First row to read (default: 1)"},
-                "max_row": {"type": "integer", "description": "Last row to read (default: last row)"},
+                "min_row": {"type": "integer", "description": "First row to read (default: 1). Use for chunked reading of large files."},
+                "max_row": {"type": "integer", "description": "Last row to read (default: last row). Set explicitly to limit chunk size."},
                 "min_col": {"type": "integer", "description": "First column to read (default: 1)"},
                 "max_col": {"type": "integer", "description": "Last column to read (default: last column)"}
             },
@@ -549,6 +723,96 @@ TOOLS = [
         }
     },
     {
+        "name": "format_range",
+        "description": "Apply formatting to a range of cells at once (e.g. A1:D1). More efficient than calling format_cell repeatedly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "cell_range": {"type": "string", "description": "Cell range, e.g. A1:D1 or A1:A10"},
+                "bold": {"type": "boolean"},
+                "italic": {"type": "boolean"},
+                "font_size": {"type": "integer", "description": "Font size in pt"},
+                "font_color": {"type": "string", "description": "Font color as hex, e.g. FF0000"},
+                "bg_color": {"type": "string", "description": "Background color as hex, e.g. FFFF00"},
+                "horizontal_align": {"type": "string", "enum": ["left", "center", "right"]},
+                "number_format": {"type": "string", "description": "Number format string, e.g. #,##0"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "cell_range"]
+        }
+    },
+    {
+        "name": "merge_cells",
+        "description": "Merge or unmerge a range of cells (e.g. A1:D1).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "cell_range": {"type": "string", "description": "Cell range to merge/unmerge, e.g. A1:D1"},
+                "unmerge": {"type": "boolean", "description": "If true, unmerge instead of merge (default: false)"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "cell_range"]
+        }
+    },
+    {
+        "name": "add_chart",
+        "description": "Add a chart (bar, line, or pie) to a sheet based on a data range.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "chart_type": {"type": "string", "enum": ["bar", "line", "pie"], "description": "Chart type"},
+                "data_range": {"type": "string", "description": "Data range including headers, e.g. A1:B10"},
+                "title": {"type": "string", "description": "Chart title (optional)"},
+                "position": {"type": "string", "description": "Cell address where the chart is placed, e.g. E5 (default: E5)"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "chart_type", "data_range"]
+        }
+    },
+    {
+        "name": "freeze_panes",
+        "description": "Freeze rows and/or columns. e.g. cell='A2' freezes row 1, cell='B1' freezes column A, cell='B2' freezes both.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "cell": {"type": "string", "description": "Cell address to freeze at, e.g. A2 (freeze row 1), B2 (freeze row 1 and column A)"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "cell"]
+        }
+    },
+    {
+        "name": "set_row_height",
+        "description": "Set the height of a specific row.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "row": {"type": "integer", "description": "Row number (1-based)"},
+                "height": {"type": "number", "description": "Row height in points"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "row", "height"]
+        }
+    },
+    {
+        "name": "add_filter",
+        "description": "Add an auto filter to a range. Enables dropdown filtering on the header row.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the Excel file"},
+                "cell_range": {"type": "string", "description": "Range to apply filter, e.g. A1:E1 or A1:E100"},
+                "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"}
+            },
+            "required": ["file_path", "cell_range"]
+        }
+    },
+    {
         "name": "get_sheet_info",
         "description": "Get basic info about a sheet: row count, column count, and used range.",
         "input_schema": {
@@ -574,6 +838,12 @@ TOOL_FUNCTIONS = {
     "create_sheet": create_sheet,
     "delete_sheet": delete_sheet,
     "format_cell": format_cell,
+    "format_range": format_range,
+    "merge_cells": merge_cells,
+    "add_chart": add_chart,
+    "freeze_panes": freeze_panes,
+    "set_row_height": set_row_height,
+    "add_filter": add_filter,
     "set_column_width": set_column_width,
     "save_excel": save_excel,
     "get_sheet_info": get_sheet_info,
