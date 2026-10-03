@@ -289,6 +289,30 @@ def test_read_text_file_shift_jis(workdir):
     assert result["encoding"] == "cp932"
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("", [("", False, False)]),
+    ("これは**強調**です", [("これは", False, False), ("強調", True, False), ("です", False, False)]),
+    ("_斜体_ と __太字__", [("斜体", False, True), (" と ", False, False), ("太字", True, False)]),
+    ("***両方***", [("両方", True, True)]),
+    ("**太字 *斜体* 太字**", [("太字 ", True, False), ("斜体", True, True), (" 太字", True, False)]),
+    # 単語の途中の _ は強調にしない
+    ("file_name_here を開く", [("file_name_here を開く", False, False)]),
+    # 記号のすぐ内側が空白なら強調にしない
+    ("2 * 3 * 4", [("2 * 3 * 4", False, False)]),
+    # コードスパンとエスケープの中の記号は書式として扱わない
+    ("`a*b*c` を実行", [("a*b*c を実行", False, False)]),
+    ("*see `a*b`*", [("see a*b", False, True)]),
+    ("`` `x` ``", [("`x`", False, False)]),
+    (r"\*強調しない\*", [("*強調しない*", False, False)]),
+    # リンクはテキストだけ残す（URL 内の _ や括弧にも反応しない）
+    ("[仕様](https://example.com/a_(b)_c) を参照", [("仕様 を参照", False, False)]),
+    ("[**重要**](https://example.com)", [("重要", True, False)]),
+])
+def test_parse_inline_formatting(text, expected):
+    runs = text_tools.parse_inline_formatting(text)
+    assert [(r["text"], r["bold"], r["italic"]) for r in runs] == expected
+
+
 def test_parse_inline_formatting_returns_dict():
     result = run("parse_inline_formatting", text="a **b**")
     assert result["success"] is True
