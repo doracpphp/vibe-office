@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # CI で使う GitHub Actions を更新する（setup-uv は完全なバージョンで固定しているため自動では上がらない）
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
