@@ -139,11 +139,11 @@ def print_banner(provider: str, model: str):
 
     # 全角文字を含んでも枠線が揃うよう表示幅から余白を計算する
     lines = ["vibe-office", "自然言語でExcel・Wordを操作するAIエージェント"]
-    inner = max(_display_width(l) for l in lines) + 4
+    inner = max(_display_width(line) for line in lines) + 4
     box = [f"╔{'═' * inner}╗"]
-    for l in lines:
-        pad = inner - _display_width(l)
-        box.append(f"║{' ' * (pad // 2)}{l}{' ' * (pad - pad // 2)}║")
+    for line in lines:
+        pad = inner - _display_width(line)
+        box.append(f"║{' ' * (pad // 2)}{line}{' ' * (pad - pad // 2)}║")
     box.append(f"╚{'═' * inner}╝")
     box_str = "\n".join(box)
 

@@ -76,7 +76,7 @@ def _replace_in_paragraph(para, old: str, new: str, limit: Optional[int]) -> int
             break
         end = start + len(old)
         run_start = 0
-        for run, text in zip(runs, texts):
+        for run, text in zip(runs, texts, strict=True):
             run_end = run_start + len(text)
             if text and run_start < end and run_end > start:
                 after = text[max(end - run_start, 0):]

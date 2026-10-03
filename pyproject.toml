@@ -17,8 +17,19 @@ package = false
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ruff>=0.16.10",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff.lint]
+# 不具合につながりやすいものに絞る（未使用の import・未定義の名前・bugbear など）
+select = ["E4", "E7", "E9", "F", "B"]
+# 値を揃えて並べた1行の if（word_tools.py）は読みやすさのため許可する
+ignore = ["E701"]
+
+[tool.ruff.lint.per-file-ignores]
+# 作業ディレクトリを決めてからツールを import する必要がある
+"mcp_server.py" = ["E402"]
