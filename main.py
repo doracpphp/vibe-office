@@ -7,10 +7,10 @@ vibe-office - チャットインターフェース
   python3 main.py --provider openrouter        # OpenRouter
   python3 main.py --provider ollama            # Ollama (ローカル)
   python3 main.py --provider ollama --model llama3.2
-  python3 main.py --provider openrouter --model google/gemini-flash-1.5
+  python3 main.py --provider openrouter --model google/gemini-3.5-flash
   python3 main.py --provider ollama --base-url http://localhost:11434/v1
   python3 main.py --provider gemini
-  python3 main.py --provider gemini --model gemini-2.5-pro
+  python3 main.py --provider gemini --model gemini-3.5-flash-lite
 """
 import sys
 import os
@@ -18,6 +18,7 @@ import argparse
 import threading
 import itertools
 import time
+import unicodedata
 
 try:
     import readline  # noqa: F401 - 矢印キー履歴ナビゲーション有効化
@@ -81,6 +82,38 @@ class Spinner:
             time.sleep(0.08)
 
 
+HELP_TEXT = """コマンド:
+  /help   - このヘルプを表示
+  /reset  - 会話履歴をリセット
+  /cwd    - 作業ディレクトリを表示
+  /cd     - 作業ディレクトリを変更
+  /ls     - ファイル一覧を表示
+  /quit   - 終了 (Ctrl+C でも可)"""
+
+
+def load_dotenv(path: str) -> None:
+    """.env を読み込んで環境変数に設定する（既に設定済みの変数は上書きしない）"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+def _display_width(text: str) -> int:
+    """全角文字を2桁として数えた表示幅"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
 def print_banner(provider: str, model: str):
     provider_label = {
         "anthropic":  f"{CYAN}Anthropic{RESET}",
@@ -89,20 +122,22 @@ def print_banner(provider: str, model: str):
         "gemini":     f"{BLUE}Google Gemini{RESET}",
     }.get(provider, provider)
 
+    # 全角文字を含んでも枠線が揃うよう表示幅から余白を計算する
+    lines = ["vibe-office", "自然言語でExcel・Wordを操作するAIエージェント"]
+    inner = max(_display_width(l) for l in lines) + 4
+    box = [f"╔{'═' * inner}╗"]
+    for l in lines:
+        pad = inner - _display_width(l)
+        box.append(f"║{' ' * (pad // 2)}{l}{' ' * (pad - pad // 2)}║")
+    box.append(f"╚{'═' * inner}╝")
+    box_str = "\n".join(box)
+
     print(f"""
-{CYAN}{BOLD}╔═══════════════════════════════════════════╗
-║            vibe-office                   ║
-║  自然言語でExcel・Wordを操作するAIエージェント ║
-╚═══════════════════════════════════════════╝{RESET}
+{CYAN}{BOLD}{box_str}{RESET}
   Provider : {provider_label}
   Model    : {BOLD}{model}{RESET}
 
-{GRAY}コマンド:
-  /reset  - 会話履歴をリセット
-  /cwd    - 作業ディレクトリを表示
-  /cd     - 作業ディレクトリを変更
-  /ls     - ファイル一覧を表示
-  /quit   - 終了 (Ctrl+C でも可){RESET}
+{GRAY}{HELP_TEXT}{RESET}
 """)
 
 
@@ -115,6 +150,10 @@ def handle_command(cmd: str):
     parts = cmd.strip().split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
+
+    if command == "/help":
+        print(f"{GRAY}{HELP_TEXT}{RESET}")
+        return True
 
     if command in ("/quit", "/exit"):
         print(f"{YELLOW}終了します。{RESET}")
@@ -160,7 +199,12 @@ def handle_command(cmd: str):
             print(f"{RED}エラー: {e}{RESET}")
         return True
 
-    return False
+    # "/Users/me/data.xlsx を開いて" のような絶対パスで始まる入力はエージェントへ渡す
+    if "/" in command[1:]:
+        return False
+
+    print(f"{RED}不明なコマンド: {command}（/help でコマンド一覧を表示）{RESET}")
+    return True
 
 
 def check_api_key(provider: str) -> bool:
@@ -195,7 +239,7 @@ def parse_args():
         epilog="""
 例:
   python3 main.py
-  python3 main.py --provider openrouter --model google/gemini-flash-1.5
+  python3 main.py --provider openrouter --model google/gemini-3.5-flash
   python3 main.py --provider ollama --model llama3.2
   python3 main.py --provider ollama --base-url http://192.168.1.10:11434/v1
         """
@@ -220,6 +264,8 @@ def parse_args():
 
 
 def main():
+    # スクリプトと同じディレクトリの .env を読み込む（--provider などの既定値にも使うため最初に行う）
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     args = parse_args()
 
     if not check_api_key(args.provider):
@@ -268,7 +314,8 @@ def main():
             if result is None:
                 agent.reset()
                 print(f"{GREEN}会話履歴をリセットしました。{RESET}")
-            continue
+            if result is not False:
+                continue
 
         spinner.start()
         try:

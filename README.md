@@ -44,14 +44,7 @@ GEMINI_API_KEY=AIza...
 OPENROUTER_API_KEY=sk-or-...
 ```
 
-Load it before running:
-
-```bash
-# bash / zsh
-source .env && uv run python main.py
-
-# Or use direnv for automatic loading
-```
+`main.py` loads the `.env` file in the project directory automatically at startup. Variables already set in your shell take precedence.
 
 ### Using environment variables directly
 
@@ -81,13 +74,13 @@ uv run python main.py
 uv run python main.py --provider openrouter
 
 # OpenRouter with a specific model
-uv run python main.py --provider openrouter --model google/gemini-flash-1.5
+uv run python main.py --provider openrouter --model google/gemini-3.5-flash
 
 # Google Gemini
 uv run python main.py --provider gemini
 
 # Google Gemini with a specific model
-uv run python main.py --provider gemini --model gemini-2.5-pro
+uv run python main.py --provider gemini --model gemini-3.5-flash-lite
 
 # Ollama (local)
 uv run python main.py --provider ollama
@@ -125,6 +118,7 @@ You> Add a table with quarterly sales data
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Show available commands |
 | `/reset` | Clear conversation history |
 | `/ls [path]` | List files (Excel and Word files highlighted) |
 | `/cd <path>` | Change working directory |
@@ -135,18 +129,18 @@ You> Add a table with quarterly sales data
 
 | Provider | Flag | Default model | API key env var |
 |----------|------|---------------|----------------|
-| Anthropic | `--provider anthropic` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
-| Google Gemini | `--provider gemini` | `gemini-2.0-flash` | `GEMINI_API_KEY` |
-| OpenRouter | `--provider openrouter` | `anthropic/claude-3.5-sonnet` | `OPENROUTER_API_KEY` |
+| Anthropic | `--provider anthropic` | `claude-sonnet-5-5` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `--provider gemini` | `gemini-3.8-flash` | `GEMINI_API_KEY` |
+| OpenRouter | `--provider openrouter` | `anthropic/claude-sonnet-5.5` | `OPENROUTER_API_KEY` |
 | Ollama | `--provider ollama` | `qwen2.5:7b` | not required |
 
-## Excel tools (13)
+## Excel tools (19)
 
 | Tool | Description |
 |------|-------------|
 | `open_excel` | Open or create a workbook |
 | `list_sheets` | List all sheet names |
-| `read_sheet` | Read sheet contents with optional range |
+| `read_sheet` | Read sheet contents (up to 100 rows per call unless a range is given) |
 | `read_cell` | Read a single cell value |
 | `write_cell` | Write a value to a cell |
 | `write_range` | Write a 2D array starting from a cell |
@@ -157,8 +151,14 @@ You> Add a table with quarterly sales data
 | `set_column_width` | Set column width |
 | `save_excel` | Save or save-as |
 | `get_sheet_info` | Get row/column counts and used range |
+| `format_range` | Apply formatting to a range at once |
+| `merge_cells` | Merge or unmerge cells |
+| `add_chart` | Add a bar / line / pie chart |
+| `freeze_panes` | Freeze rows and/or columns |
+| `set_row_height` | Set row height |
+| `add_filter` | Add an auto filter |
 
-## Word tools (13)
+## Word tools (19)
 
 | Tool | Description |
 |------|-------------|
@@ -167,7 +167,7 @@ You> Add a table with quarterly sales data
 | `read_paragraph` | Read a single paragraph and its formatting |
 | `append_paragraph` | Append a paragraph at the end |
 | `insert_paragraph` | Insert before or after a paragraph index |
-| `replace_text` | Find and replace text |
+| `replace_text` | Find and replace text (body, tables, headers/footers; works across formatting runs) |
 | `delete_paragraph` | Delete a paragraph by index |
 | `format_paragraph` | Apply formatting to a paragraph |
 | `insert_image` | Insert an image file |
@@ -175,6 +175,44 @@ You> Add a table with quarterly sales data
 | `add_heading` | Append a heading (level 1–9) |
 | `save_word` | Save or save-as |
 | `get_document_info` | Get heading list, paragraph and table counts |
+| `append_rich_paragraph` | Append a paragraph with per-run bold/italic/color |
+| `set_page_layout` | Set page orientation and margins |
+| `add_page_break` | Insert a page break |
+| `read_table` | Read an existing table |
+| `format_table` | Format a table cell (font, background, alignment) |
+| `add_header_footer` | Set header / footer text |
+
+## Text / Markdown tools (3)
+
+| Tool | Description |
+|------|-------------|
+| `read_text_file` | Read a text file (auto-detects UTF-8 / Shift_JIS) |
+| `parse_markdown` | Parse Markdown into headings, paragraphs, tables, lists, and code blocks |
+| `parse_inline_formatting` | Convert `**bold**` / `*italic*` into runs for `append_rich_paragraph` |
+
+## Using as an MCP server (Claude Code)
+
+All tools above are also available as an MCP server:
+
+```bash
+claude mcp add vibe-office -- uv run --directory /path/to/vibe-office python mcp_server.py
+```
+
+By default the server can only access files inside the vibe-office directory. To work on files elsewhere, set `VIBE_OFFICE_WORKDIR`:
+
+```bash
+claude mcp add vibe-office -e VIBE_OFFICE_WORKDIR=/path/to/documents -- uv run --directory /path/to/vibe-office python mcp_server.py
+```
+
+## File access
+
+The agent can only read and write files inside the current working directory (the directory you started in, or the one you moved to with `/cd`). Paths outside it are rejected.
+
+## Running tests
+
+```bash
+uv run pytest
+```
 
 ## Project structure
 
@@ -182,8 +220,12 @@ You> Add a table with quarterly sales data
 vibe-office/
 ├── main.py          # Chat UI and CLI entry point
 ├── agent.py         # Claude API / OpenAI-compatible agent loop
+├── mcp_server.py    # MCP server (for Claude Code, etc.)
 ├── excel_tools.py   # Excel operations (openpyxl)
 ├── word_tools.py    # Word operations (python-docx)
+├── text_tools.py    # Text / Markdown loading
+├── common.py        # Shared helpers (path checks, file cache, tool runner)
+├── tests/           # Tests (pytest)
 ├── pyproject.toml   # Project config (uv)
 ├── .env.example     # API key template
 └── .env             # Your API keys (git-ignored, create from .env.example)

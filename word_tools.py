@@ -3,66 +3,92 @@ Word操作ツール群 - python-docxを使用してWordファイルを操作す�
 """
 import os
 import re
-import json
-from typing import Any, Optional
+from typing import Optional
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+from common import FileCache, run_tool, safe_path, validate_hex_color
+
 
 # 現在開いているドキュメントのキャッシュ
-_doc_cache: dict[str, Document] = {}
+_cache = FileCache(load=Document, create=lambda _: Document())
 
-# 操作を許可するベースディレクトリ（起動時のカレントディレクトリ）
-_BASE_DIR = os.path.realpath(os.getcwd())
+# "Heading 1" / "Heading" などの見出しスタイル名
+_HEADING_STYLE_RE = re.compile(r'^Heading\s*(\d*)$')
 
-_HEX_COLOR_RE = re.compile(r'^[0-9A-Fa-f]{6}$')
-
-
-def _reraise_if_fatal(e: Exception) -> None:
-    """KeyboardInterrupt / SystemExit は握りつぶさず再 raise する"""
-    if isinstance(e, (KeyboardInterrupt, SystemExit)):
-        raise
+# w:tcPr 内で w:shd より後ろに置く必要がある要素（OOXML スキーマの順序）
+_TCPR_AFTER_SHD = (
+    "w:noWrap", "w:tcMar", "w:textDirection", "w:tcFitText", "w:vAlign",
+    "w:hideMark", "w:headers", "w:cellIns", "w:cellDel", "w:cellMerge", "w:tcPrChange",
+)
 
 
-def _safe_path(file_path: str) -> str:
-    """パストラバーサルを防ぐ。BASE_DIR 外のパスは拒否する。"""
-    abs_path = os.path.realpath(os.path.join(_BASE_DIR, file_path))
-    if not abs_path.startswith(_BASE_DIR + os.sep) and abs_path != _BASE_DIR:
-        raise PermissionError(
-            f"アクセス拒否: 作業ディレクトリ外のパスは操作できません: {abs_path}"
-        )
-    return abs_path
-
-
-def _validate_hex_color(value: str, name: str) -> str:
-    normalized = value.lstrip("#").upper()
-    if not _HEX_COLOR_RE.match(normalized):
-        raise ValueError(f"{name} は6桁の16進数カラーコードで指定してください（例: FF0000）")
-    return normalized
-
-
-def _get_doc(file_path: str, create_if_missing: bool = False) -> Document:
-    abs_path = _safe_path(file_path)
-    if abs_path in _doc_cache:
-        return _doc_cache[abs_path]
-    if os.path.exists(abs_path):
-        doc = Document(abs_path)
-    elif create_if_missing:
-        doc = Document()
-    else:
-        raise FileNotFoundError(f"ファイルが見つかりません: {abs_path}")
-    _doc_cache[abs_path] = doc
-    return doc
+def _get_doc(file_path: str, create_if_missing: bool = False):
+    return _cache.get(file_path, create_if_missing=create_if_missing)
 
 
 def _save(file_path: str):
-    abs_path = _safe_path(file_path)
-    doc = _doc_cache.get(abs_path)
-    if doc:
-        doc.save(abs_path)
+    return _cache.save(file_path, _get_doc(file_path))
+
+
+def _iter_block_paragraphs(container, seen_cells: set):
+    """本文・セル・ヘッダーなどに含まれる段落を、入れ子のテーブルも含めて返す"""
+    yield from container.paragraphs
+    for table in container.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                # 結合セルは row.cells に同じセルが複数回現れるので1回だけ処理する
+                if cell._tc in seen_cells:
+                    continue
+                seen_cells.add(cell._tc)
+                yield from _iter_block_paragraphs(cell, seen_cells)
+
+
+def _iter_all_paragraphs(doc):
+    """本文・テーブル・ヘッダー/フッターの全段落を返す"""
+    seen_cells: set = set()
+    yield from _iter_block_paragraphs(doc, seen_cells)
+    for section in doc.sections:
+        for part in (section.header, section.footer,
+                     section.first_page_header, section.first_page_footer,
+                     section.even_page_header, section.even_page_footer):
+            # 前セクションにリンクされたものは同一内容（参照すると空の定義が作られてしまう）
+            if not part.is_linked_to_previous:
+                yield from _iter_block_paragraphs(part, seen_cells)
+
+
+def _replace_in_paragraph(para, old: str, new: str, limit: Optional[int]) -> int:
+    """段落内の old を new に置換して置換数を返す。
+
+    Word は同じ見た目の文字列でも複数のラン（書式単位）に分割して保存することが多いため、
+    ランをまたぐ一致も置換する。置換後の文字列は一致開始位置のランの書式を引き継ぐ。
+    """
+    runs = para.runs
+    count = 0
+    search_from = 0
+    while limit is None or count < limit:
+        texts = [r.text for r in runs]
+        start = "".join(texts).find(old, search_from)
+        if start < 0:
+            break
+        end = start + len(old)
+        run_start = 0
+        for run, text in zip(runs, texts):
+            run_end = run_start + len(text)
+            if text and run_start < end and run_end > start:
+                after = text[max(end - run_start, 0):]
+                if run_start <= start:
+                    run.text = text[:start - run_start] + new + after
+                else:
+                    run.text = after
+            run_start = run_end
+        # new に old が含まれていても無限ループしないよう、置換後の位置から探す
+        search_from = start + len(new)
+        count += 1
+    return count
 
 
 def _para_summary(para, index: int) -> dict:
@@ -80,20 +106,24 @@ def _para_summary(para, index: int) -> dict:
 
 
 def open_word(file_path: str, create_if_missing: bool = False) -> dict:
-    """Wordファイルを開く"""
+    """Wordファイルを開く（create_if_missing=True なら新規作成して保存する）"""
     try:
+        abs_path = safe_path(file_path)
+        is_new = not os.path.exists(abs_path)
         doc = _get_doc(file_path, create_if_missing=create_if_missing)
+        if is_new:
+            _save(file_path)
         para_count = len(doc.paragraphs)
         table_count = len(doc.tables)
+        action = "新規作成しました" if is_new else "開きました"
         return {
             "success": True,
-            "file_path": os.path.abspath(file_path),
+            "file_path": abs_path,
             "paragraph_count": para_count,
             "table_count": table_count,
-            "message": f"ドキュメントを開きました。段落数: {para_count}, テーブル数: {table_count}"
+            "message": f"ドキュメントを{action}。段落数: {para_count}, テーブル数: {table_count}"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -102,9 +132,6 @@ def read_document(file_path: str, include_tables: bool = True) -> dict:
     try:
         doc = _get_doc(file_path)
         paragraphs = [_para_summary(p, i) for i, p in enumerate(doc.paragraphs)]
-
-        # 全文テキスト
-        full_text = "\n".join(p["text"] for p in paragraphs)
 
         tables = []
         if include_tables:
@@ -118,11 +145,9 @@ def read_document(file_path: str, include_tables: bool = True) -> dict:
             "success": True,
             "paragraph_count": len(paragraphs),
             "paragraphs": paragraphs,
-            "full_text": full_text,
             "tables": tables,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -145,7 +170,6 @@ def read_paragraph(file_path: str, index: int) -> dict:
             "runs": runs,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -173,7 +197,6 @@ def append_paragraph(file_path: str, text: str,
             "index": new_index,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -200,7 +223,7 @@ def append_rich_paragraph(file_path: str,
             if run_size:
                 run.font.size = Pt(run_size)
             if r.get("color"):
-                hex_color = _validate_hex_color(r["color"], "color")
+                hex_color = validate_hex_color(r["color"], "color")
                 run.font.color.rgb = RGBColor(
                     int(hex_color[0:2], 16),
                     int(hex_color[2:4], 16),
@@ -214,7 +237,6 @@ def append_rich_paragraph(file_path: str,
             "index": new_index,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -267,50 +289,33 @@ def insert_paragraph(file_path: str, index: int, text: str,
             "inserted_index": inserted_index,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
 def replace_text(file_path: str, old_text: str, new_text: str,
                  all_occurrences: bool = True) -> dict:
-    """ドキュメント内のテキストを検索・置換する"""
+    """ドキュメント内のテキストを検索・置換する（本文・テーブル・ヘッダー/フッター）"""
     try:
+        if not old_text:
+            return {"success": False, "error": "old_text が空です"}
         doc = _get_doc(file_path)
+        limit = None if all_occurrences else 1
         count = 0
 
-        for para in doc.paragraphs:
-            if old_text not in para.text:
-                continue
-            # Run単位で置換（書式を保持するためrun内で処理）
-            for run in para.runs:
-                if old_text in run.text:
-                    run.text = run.text.replace(
-                        old_text, new_text, -1 if all_occurrences else 1
-                    )
-                    count += 1
-                    if not all_occurrences:
-                        break
-            if not all_occurrences and count > 0:
+        for para in _iter_all_paragraphs(doc):
+            count += _replace_in_paragraph(
+                para, old_text, new_text, None if limit is None else limit - count)
+            if limit is not None and count >= limit:
                 break
 
-        # テーブル内も処理
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            if old_text in run.text:
-                                run.text = run.text.replace(old_text, new_text)
-                                count += 1
-
-        _save(file_path)
+        if count:
+            _save(file_path)
         return {
             "success": True,
             "replaced_count": count,
             "message": f"「{old_text}」→「{new_text}」に {count} 箇所置換しました"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -332,7 +337,6 @@ def delete_paragraph(file_path: str, index: int) -> dict:
             "remaining_paragraphs": len(doc.paragraphs),
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -371,7 +375,7 @@ def format_paragraph(file_path: str, index: int,
             if font_size is not None:
                 run.font.size = Pt(font_size)
             if font_color is not None:
-                hex_color = _validate_hex_color(font_color, "font_color")
+                hex_color = validate_hex_color(font_color, "font_color")
                 r = int(hex_color[0:2], 16)
                 g = int(hex_color[2:4], 16)
                 b = int(hex_color[4:6], 16)
@@ -380,7 +384,6 @@ def format_paragraph(file_path: str, index: int,
         _save(file_path)
         return {"success": True, "message": f"インデックス {index} の書式を更新しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -389,6 +392,7 @@ def insert_image(file_path: str, image_path: str,
                  width_cm: Optional[float] = None) -> dict:
     """画像をドキュメントに挿入する（paragraph_index省略時は末尾）"""
     try:
+        image_path = safe_path(image_path)
         if not os.path.exists(image_path):
             return {"success": False, "error": f"画像ファイルが見つかりません: {image_path}"}
 
@@ -420,7 +424,6 @@ def insert_image(file_path: str, image_path: str,
             "inserted_index": inserted_index,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -429,16 +432,24 @@ def add_table(file_path: str, data: list[list],
               has_header: bool = True) -> dict:
     """テーブルを追加する（data: 2次元配列、先頭行をヘッダーとして太字に）"""
     try:
+        if not isinstance(data, list) or not data:
+            return {"success": False, "error": "data には空でない2次元配列を指定してください"}
+        data = [r if isinstance(r, list) else [r] for r in data]
+
         doc = _get_doc(file_path, create_if_missing=True)
-        if not data:
-            return {"success": False, "error": "data が空です"}
+        if paragraph_index is not None and not 0 <= paragraph_index < len(doc.paragraphs):
+            return {"success": False, "error": f"インデックス {paragraph_index} は範囲外です"}
 
         rows = len(data)
-        cols = max(len(row) for row in data)
+        cols = max(max(len(row) for row in data), 1)
 
         # テーブルを文書末尾に追加
         table = doc.add_table(rows=rows, cols=cols)
-        table.style = "Table Grid"
+        try:
+            table.style = "Table Grid"
+        except KeyError:
+            # Word で作成した文書には "Table Grid" スタイルが定義されていないことがある
+            pass
 
         for r_idx, row_data in enumerate(data):
             for c_idx, cell_val in enumerate(row_data):
@@ -449,7 +460,7 @@ def add_table(file_path: str, data: list[list],
                         run.bold = True
 
         # 指定段落の後ろに移動
-        if paragraph_index is not None and paragraph_index < len(doc.paragraphs):
+        if paragraph_index is not None:
             ref_para = doc.paragraphs[paragraph_index]
             tbl_elem = table._tbl
             tbl_elem.getparent().remove(tbl_elem)
@@ -461,7 +472,6 @@ def add_table(file_path: str, data: list[list],
             "message": f"{rows}行×{cols}列のテーブルを追加しました",
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -478,21 +488,23 @@ def add_heading(file_path: str, text: str, level: int = 1) -> dict:
             "index": idx,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
 def save_word(file_path: str, save_as: Optional[str] = None) -> dict:
-    """Wordファイルを保存する"""
+    """Wordファイルを保存する（save_as を指定すると別名保存）"""
     try:
         doc = _get_doc(file_path)
-        target = os.path.abspath(save_as if save_as else file_path)
-        doc.save(target)
         if save_as:
-            _doc_cache[target] = doc
+            # 別名保存先も作業ディレクトリ内に限定する。
+            # 同じオブジェクトを2つのパスで共有しないよう、次回はディスクから読み直す
+            target = safe_path(save_as)
+            doc.save(target)
+            _cache.evict(save_as)
+        else:
+            target = _save(file_path)
         return {"success": True, "message": f"'{target}' に保存しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -500,12 +512,12 @@ def get_document_info(file_path: str) -> dict:
     """ドキュメントの構造情報（見出し・段落数・テーブル数）を返す"""
     try:
         doc = _get_doc(file_path)
-        headings = [
-            {"index": i, "level": int(p.style.name.split()[-1]) if p.style.name.startswith("Heading") else 0,
-             "text": p.text}
-            for i, p in enumerate(doc.paragraphs)
-            if p.style.name.startswith("Heading")
-        ]
+        headings = []
+        for i, p in enumerate(doc.paragraphs):
+            # "Heading 1" 形式以外（カスタムの "Heading Custom" など）でも落ちないようにする
+            m = _HEADING_STYLE_RE.match(p.style.name if p.style is not None else "")
+            if m:
+                headings.append({"index": i, "level": int(m.group(1) or 0), "text": p.text})
         return {
             "success": True,
             "paragraph_count": len(doc.paragraphs),
@@ -513,7 +525,6 @@ def get_document_info(file_path: str) -> dict:
             "headings": headings,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -527,27 +538,29 @@ def set_page_layout(file_path: str,
     try:
         from docx.enum.section import WD_ORIENT
         doc = _get_doc(file_path, create_if_missing=True)
-        section = doc.sections[0]
-
+        orient = None
         if orientation is not None:
             if orientation.lower() in ("landscape", "横"):
-                if section.orientation != WD_ORIENT.LANDSCAPE:
-                    section.orientation = WD_ORIENT.LANDSCAPE
-                    section.page_width, section.page_height = section.page_height, section.page_width
+                orient = WD_ORIENT.LANDSCAPE
             elif orientation.lower() in ("portrait", "縦"):
-                if section.orientation != WD_ORIENT.PORTRAIT:
-                    section.orientation = WD_ORIENT.PORTRAIT
-                    section.page_width, section.page_height = section.page_height, section.page_width
+                orient = WD_ORIENT.PORTRAIT
+            else:
+                return {"success": False, "error": "orientation は portrait / landscape のいずれかを指定してください"}
 
-        if top_cm    is not None: section.top_margin    = Cm(top_cm)
-        if bottom_cm is not None: section.bottom_margin = Cm(bottom_cm)
-        if left_cm   is not None: section.left_margin   = Cm(left_cm)
-        if right_cm  is not None: section.right_margin  = Cm(right_cm)
+        # セクション区切りがある文書でも全ページに適用する
+        for section in doc.sections:
+            if orient is not None and section.orientation != orient:
+                section.orientation = orient
+                section.page_width, section.page_height = section.page_height, section.page_width
+
+            if top_cm    is not None: section.top_margin    = Cm(top_cm)
+            if bottom_cm is not None: section.bottom_margin = Cm(bottom_cm)
+            if left_cm   is not None: section.left_margin   = Cm(left_cm)
+            if right_cm  is not None: section.right_margin  = Cm(right_cm)
 
         _save(file_path)
         return {"success": True, "message": "ページレイアウトを設定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -575,7 +588,6 @@ def add_page_break(file_path: str,
         return {"success": True, "message": f"改ページをインデックス {inserted_index} に挿入しました",
                 "inserted_index": inserted_index}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -601,7 +613,6 @@ def read_table(file_path: str, table_index: int) -> dict:
             "rows": rows_data,
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -639,22 +650,25 @@ def format_table(file_path: str, table_index: int,
                 if italic    is not None: run.italic = italic
                 if font_size is not None: run.font.size = Pt(font_size)
                 if font_color is not None:
-                    hc = _validate_hex_color(font_color, "font_color")
+                    hc = validate_hex_color(font_color, "font_color")
                     run.font.color.rgb = RGBColor(int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16))
 
         if bg_color is not None:
-            hc = _validate_hex_color(bg_color, "bg_color")
+            hc = validate_hex_color(bg_color, "bg_color")
             tcPr = cell._tc.get_or_add_tcPr()
+            # 既存の網掛けを置き換える（w:shd が重複すると Word が修復ダイアログを出す）
+            for old_shd in tcPr.findall(qn("w:shd")):
+                tcPr.remove(old_shd)
             shd = OxmlElement("w:shd")
             shd.set(qn("w:val"), "clear")
             shd.set(qn("w:color"), "auto")
             shd.set(qn("w:fill"), hc)
-            tcPr.append(shd)
+            # スキーマ上の順序を守って挿入する
+            tcPr.insert_element_before(shd, *_TCPR_AFTER_SHD)
 
         _save(file_path)
         return {"success": True, "message": f"テーブル {table_index} の [{row}][{col}] に書式を適用しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -682,7 +696,6 @@ def add_header_footer(file_path: str,
         if footer_text is not None: parts.append(f"フッター「{footer_text}」")
         return {"success": True, "message": f"{' / '.join(parts)} を設定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -761,7 +774,11 @@ TOOLS = [
     },
     {
         "name": "replace_text",
-        "description": "Find and replace text in the document. Useful for editing and proofreading.",
+        "description": (
+            "Find and replace text in the document body, tables, and headers/footers. "
+            "Matches that span multiple formatting runs are also replaced. "
+            "Useful for editing and proofreading."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1002,8 +1019,4 @@ TOOL_FUNCTIONS = {
 
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
-    func = TOOL_FUNCTIONS.get(tool_name)
-    if not func:
-        return json.dumps({"success": False, "error": f"不明なツール: {tool_name}"}, ensure_ascii=False)
-    result = func(**tool_input)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return run_tool(TOOL_FUNCTIONS, tool_name, tool_input, cache=_cache)

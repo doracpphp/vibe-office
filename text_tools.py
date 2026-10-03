@@ -4,51 +4,53 @@
 """
 import os
 import re
-import json
 from typing import Optional
 
-_BASE_DIR = os.path.realpath(os.getcwd())
+from common import run_tool, safe_path
 
 
-def _safe_path(file_path: str) -> str:
-    abs_path = os.path.realpath(os.path.join(_BASE_DIR, file_path))
-    if not abs_path.startswith(_BASE_DIR + os.sep) and abs_path != _BASE_DIR:
-        raise PermissionError(
-            f"アクセス拒否: 作業ディレクトリ外のパスは操作できません: {abs_path}"
-        )
-    return abs_path
+def _read_text(abs_path: str, encoding: Optional[str]) -> tuple[str, str]:
+    """テキストを読み込んで (内容, 使用したエンコーディング) を返す。
 
-
-def _reraise_if_fatal(e: Exception) -> None:
-    if isinstance(e, (KeyboardInterrupt, SystemExit)):
-        raise
+    encoding 省略時は UTF-8（BOM 付きも可）→ Shift_JIS(cp932) の順に試す。
+    """
+    if encoding:
+        with open(abs_path, encoding=encoding) as f:
+            return f.read(), encoding
+    with open(abs_path, "rb") as f:
+        raw = f.read()
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("UTF-8 / Shift_JIS として読めません。encoding を指定してください")
 
 
 # ── ツール関数 ──────────────────────────────────────────────────────────────
 
 
-def read_text_file(file_path: str, encoding: str = "utf-8") -> dict:
+def read_text_file(file_path: str, encoding: Optional[str] = None) -> dict:
     """テキストファイル（.txt / .md など）の内容をそのまま読み取る"""
     try:
-        abs_path = _safe_path(file_path)
+        abs_path = safe_path(file_path)
         if not os.path.exists(abs_path):
             return {"success": False, "error": f"ファイルが見つかりません: {abs_path}"}
-        with open(abs_path, encoding=encoding) as f:
-            content = f.read()
+        content, used_encoding = _read_text(abs_path, encoding)
         lines = content.splitlines()
         return {
             "success": True,
             "file_path": abs_path,
+            "encoding": used_encoding,
             "content": content,
             "line_count": len(lines),
             "char_count": len(content),
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
-def parse_markdown(file_path: str, encoding: str = "utf-8") -> dict:
+def parse_markdown(file_path: str, encoding: Optional[str] = None) -> dict:
     """
     Markdownファイルを解析して構造化データを返す。
     返却する blocks リストの各要素の type:
@@ -60,11 +62,10 @@ def parse_markdown(file_path: str, encoding: str = "utf-8") -> dict:
       - hr        : 水平線
     """
     try:
-        abs_path = _safe_path(file_path)
+        abs_path = safe_path(file_path)
         if not os.path.exists(abs_path):
             return {"success": False, "error": f"ファイルが見つかりません: {abs_path}"}
-        with open(abs_path, encoding=encoding) as f:
-            raw = f.read()
+        raw, _ = _read_text(abs_path, encoding)
 
         blocks = _parse_blocks(raw)
 
@@ -86,7 +87,6 @@ def parse_markdown(file_path: str, encoding: str = "utf-8") -> dict:
             "block_count": len(blocks),
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -98,7 +98,7 @@ def _parse_table(lines: list[str]) -> Optional[dict]:
         return None
     # セパレータ行（ --- | --- 形式）チェック
     sep = lines[1].strip()
-    if not re.match(r'^[\s|:\-]+$', sep):
+    if "-" not in sep or not re.match(r'^[\s|:\-]+$', sep):
         return None
 
     def split_row(line: str) -> list[str]:
@@ -141,6 +141,17 @@ def parse_inline_formatting(text: str) -> list[dict]:
     return runs or [{"text": text, "bold": False, "italic": False}]
 
 
+_HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)')
+_LIST_RE = re.compile(r'^\s*(?:[-*+]|\d+\.)\s+')
+_HR_RE = re.compile(r'^(\-{3,}|\*{3,}|_{3,})\s*$')
+
+
+def _is_block_start(line: str) -> bool:
+    """段落以外のブロック（見出し・コード・テーブル・リスト・水平線）の開始行か"""
+    return bool(line.startswith("```") or _HR_RE.match(line) or _HEADING_RE.match(line)
+                or "|" in line or _LIST_RE.match(line))
+
+
 def _parse_blocks(src: str) -> list[dict]:
     blocks: list[dict] = []
     lines = src.splitlines()
@@ -162,13 +173,13 @@ def _parse_blocks(src: str) -> list[dict]:
             continue
 
         # ── 水平線 ──
-        if re.match(r'^(\-{3,}|\*{3,}|_{3,})\s*$', line):
+        if _HR_RE.match(line):
             blocks.append({"type": "hr"})
             i += 1
             continue
 
         # ── 見出し (ATX) ──
-        m = re.match(r'^(#{1,6})\s+(.*)', line)
+        m = _HEADING_RE.match(line)
         if m:
             blocks.append({
                 "type": "heading",
@@ -191,15 +202,16 @@ def _parse_blocks(src: str) -> list[dict]:
                 # テーブルとして解釈できなければ段落扱い
                 for tl in table_lines:
                     if tl.strip():
-                        blocks.append({"type": "paragraph", "text": tl.strip()})
+                        blocks.append({"type": "paragraph", "text": tl.strip(),
+                                       "runs": parse_inline_formatting(tl.strip())})
             continue
 
         # ── リスト ──
-        if re.match(r'^(\s*[-*+]\s|\s*\d+\.\s)', line):
+        if _LIST_RE.match(line):
             list_lines = []
             ordered = bool(re.match(r'^\s*\d+\.', line))
-            while i < len(lines) and re.match(r'^(\s*[-*+]\s|\s*\d+\.\s)', lines[i]):
-                item = re.sub(r'^\s*[-*+]\s+|\s*\d+\.\s+', '', lines[i]).strip()
+            while i < len(lines) and _LIST_RE.match(lines[i]):
+                item = _LIST_RE.sub('', lines[i], count=1).strip()
                 list_lines.append(item)
                 i += 1
             blocks.append({
@@ -216,20 +228,18 @@ def _parse_blocks(src: str) -> list[dict]:
             continue
 
         # ── 段落（複数行連続をまとめる）──
-        para_lines = []
-        while i < len(lines) and lines[i].strip() and not lines[i].startswith("#") \
-                and not lines[i].startswith("```") and "|" not in lines[i] \
-                and not re.match(r'^(\s*[-*+]\s|\s*\d+\.\s)', lines[i]) \
-                and not re.match(r'^(\-{3,}|\*{3,}|_{3,})\s*$', lines[i]):
+        # 先頭行は必ず消費する（ブロック開始と判定されない行で無限ループしないように）
+        para_lines = [line.strip()]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not _is_block_start(lines[i]):
             para_lines.append(lines[i].strip())
             i += 1
-        if para_lines:
-            joined = " ".join(para_lines)
-            blocks.append({
-                "type": "paragraph",
-                "text": joined,
-                "runs": parse_inline_formatting(joined),
-            })
+        joined = " ".join(para_lines)
+        blocks.append({
+            "type": "paragraph",
+            "text": joined,
+            "runs": parse_inline_formatting(joined),
+        })
 
     return blocks
 
@@ -241,7 +251,7 @@ TOOLS = [
         "name": "parse_inline_formatting",
         "description": (
             "Parse inline Markdown formatting (**bold**, *italic*, ***bold-italic***) "
-            "in a text string and return a list of runs with bold/italic flags. "
+            "in a text string and return {'runs': [...]} with bold/italic flags per run. "
             "Pass the result to append_rich_paragraph to write formatted text into Word."
         ),
         "input_schema": {
@@ -262,7 +272,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Path to the text file"},
-                "encoding": {"type": "string", "description": "File encoding (default: utf-8)"},
+                "encoding": {"type": "string", "description": "File encoding, e.g. utf-8 or cp932 (default: auto-detect UTF-8 / Shift_JIS)"},
             },
             "required": ["file_path"],
         },
@@ -278,7 +288,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Path to the Markdown file (.md)"},
-                "encoding": {"type": "string", "description": "File encoding (default: utf-8)"},
+                "encoding": {"type": "string", "description": "File encoding, e.g. utf-8 or cp932 (default: auto-detect UTF-8 / Shift_JIS)"},
             },
             "required": ["file_path"],
         },
@@ -286,15 +296,11 @@ TOOLS = [
 ]
 
 TOOL_FUNCTIONS = {
-    "parse_inline_formatting": lambda text: parse_inline_formatting(text),
+    "parse_inline_formatting": lambda text: {"success": True, "runs": parse_inline_formatting(text)},
     "read_text_file": read_text_file,
     "parse_markdown": parse_markdown,
 }
 
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
-    func = TOOL_FUNCTIONS.get(tool_name)
-    if not func:
-        return json.dumps({"success": False, "error": f"不明なツール: {tool_name}"}, ensure_ascii=False)
-    result = func(**tool_input)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return run_tool(TOOL_FUNCTIONS, tool_name, tool_input)

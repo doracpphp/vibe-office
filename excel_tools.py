@@ -2,89 +2,127 @@
 Excel操作ツール群 - openpyxlを使用してExcelファイルを操作する
 """
 import os
-import re
-import json
+import datetime
+from copy import copy
 from typing import Any, Optional
-import openpyxl
 from openpyxl import load_workbook, Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter, range_boundaries
+
+from common import FileCache, run_tool, safe_path, validate_hex_color
 
 
-# 現在開いているワークブックのキャッシュ
-_workbook_cache: dict[str, Workbook] = {}
+_VALID_ALIGN = {"left", "center", "right"}
 
-# 操作を許可するベースディレクトリ（起動時のカレントディレクトリ）
-_BASE_DIR = os.path.realpath(os.getcwd())
-
-_HEX_COLOR_RE = re.compile(r'^[0-9A-Fa-f]{6}$')
-_VALID_ALIGN   = {"left", "center", "right"}
+# read_sheet で max_row を省略したときに一度に返す最大行数
+_DEFAULT_READ_ROWS = 100
 
 
-def _reraise_if_fatal(e: Exception) -> None:
-    """KeyboardInterrupt / SystemExit は握りつぶさず再 raise する"""
-    if isinstance(e, (KeyboardInterrupt, SystemExit)):
-        raise
+def _load(abs_path: str) -> Workbook:
+    # .xlsm はマクロを保持しないと保存後に Excel で開けなくなる
+    return load_workbook(abs_path, keep_vba=abs_path.lower().endswith(".xlsm"))
 
 
-def _safe_path(file_path: str) -> str:
-    """パストラバーサルを防ぐ。BASE_DIR 外のパスは拒否する。"""
-    abs_path = os.path.realpath(os.path.join(_BASE_DIR, file_path))
-    if not abs_path.startswith(_BASE_DIR + os.sep) and abs_path != _BASE_DIR:
-        raise PermissionError(
-            f"アクセス拒否: 作業ディレクトリ外のパスは操作できません: {abs_path}"
-        )
-    return abs_path
-
-
-def _validate_hex_color(value: str, name: str) -> str:
-    """HEXカラー文字列を検証して正規化する（例: '#FF0000' → 'FF0000'）"""
-    normalized = value.lstrip("#").upper()
-    if not _HEX_COLOR_RE.match(normalized):
-        raise ValueError(f"{name} は6桁の16進数カラーコードで指定してください（例: FF0000）")
-    return normalized
-
-
-def _get_workbook(file_path: str, create_if_missing: bool = False) -> Workbook:
-    abs_path = _safe_path(file_path)
-    if abs_path in _workbook_cache:
-        return _workbook_cache[abs_path]
-    if os.path.exists(abs_path):
-        wb = load_workbook(abs_path)
-    elif create_if_missing:
-        wb = Workbook()
-        # デフォルトシート名を "Sheet1" に統一
-        wb.active.title = "Sheet1"
-    else:
-        raise FileNotFoundError(f"ファイルが見つかりません: {abs_path}")
-    _workbook_cache[abs_path] = wb
+def _create(abs_path: str) -> Workbook:
+    wb = Workbook()
+    # デフォルトシート名を "Sheet1" に統一
+    wb.active.title = "Sheet1"
     return wb
 
 
+# 現在開いているワークブックのキャッシュ
+_cache = FileCache(load=_load, create=_create)
+
+
+def _get_workbook(file_path: str, create_if_missing: bool = False) -> Workbook:
+    return _cache.get(file_path, create_if_missing=create_if_missing)
+
+
+def _save(file_path: str, wb: Workbook) -> str:
+    return _cache.save(file_path, wb)
+
+
 def _cell_value(cell) -> Any:
-    """セルの値を返す。日付型は文字列に変換"""
-    import datetime
-    if isinstance(cell.value, (datetime.datetime, datetime.date)):
+    """セルの値を返す。日付・時刻型は文字列に変換"""
+    if isinstance(cell.value, (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)):
         return str(cell.value)
     return cell.value
+
+
+def _iter_cells(ws, cell_range: str):
+    """'A1' / 'A1:D5' / 'A' / '1' いずれの指定でもセルを1つずつ返す"""
+    target = ws[cell_range]
+    if not isinstance(target, tuple):
+        yield target
+        return
+    for item in target:
+        if isinstance(item, tuple):
+            yield from item
+        else:
+            yield item
+
+
+def _apply_format(cell, bold, italic, font_size, font_color,
+                  bg_color, horizontal_align, number_format) -> None:
+    """既存の書式（フォント名・下線・縦位置など）を保ったまま指定項目だけ変更する"""
+    if any(v is not None for v in (bold, italic, font_size, font_color)):
+        font = copy(cell.font)
+        if bold is not None:
+            font.bold = bold
+        if italic is not None:
+            font.italic = italic
+        if font_size is not None:
+            font.size = font_size
+        if font_color is not None:
+            font.color = font_color
+        cell.font = font
+    if bg_color is not None:
+        cell.fill = PatternFill(fill_type="solid", fgColor=bg_color)
+    if horizontal_align is not None:
+        alignment = copy(cell.alignment)
+        alignment.horizontal = horizontal_align
+        cell.alignment = alignment
+    if number_format is not None:
+        cell.number_format = number_format
+
+
+def _format_cells(file_path: str, cell_range: str, sheet_name: Optional[str], **fmt) -> int:
+    wb = _get_workbook(file_path)
+    ws = wb[sheet_name] if sheet_name else wb.active
+
+    for key in ("font_color", "bg_color"):
+        fmt[key] = validate_hex_color(fmt[key], key) if fmt[key] else None
+    if fmt["horizontal_align"] and fmt["horizontal_align"] not in _VALID_ALIGN:
+        raise ValueError(f"horizontal_align は {_VALID_ALIGN} のいずれかを指定してください")
+
+    count = 0
+    for cell in _iter_cells(ws, cell_range):
+        _apply_format(cell, **fmt)
+        count += 1
+    _save(file_path, wb)
+    return count
 
 
 # ── ツール関数 ──────────────────────────────────────────────────────────────
 
 
 def open_excel(file_path: str, create_if_missing: bool = False) -> dict:
-    """Excelファイルを開く（またはキャッシュに読み込む）"""
+    """Excelファイルを開く（create_if_missing=True なら新規作成して保存する）"""
     try:
+        abs_path = safe_path(file_path)
+        is_new = not os.path.exists(abs_path)
         wb = _get_workbook(file_path, create_if_missing=create_if_missing)
+        if is_new:
+            _save(file_path, wb)
         sheets = wb.sheetnames
+        action = "新規作成しました" if is_new else "開きました"
         return {
             "success": True,
-            "file_path": os.path.abspath(file_path),
+            "file_path": abs_path,
             "sheets": sheets,
-            "message": f"ファイルを開きました。シート: {', '.join(sheets)}"
+            "message": f"ファイルを{action}。シート: {', '.join(sheets)}"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -94,51 +132,44 @@ def list_sheets(file_path: str) -> dict:
         wb = _get_workbook(file_path)
         return {"success": True, "sheets": wb.sheetnames}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
 def read_sheet(file_path: str, sheet_name: Optional[str] = None,
                min_row: int = 1, max_row: Optional[int] = None,
                min_col: int = 1, max_col: Optional[int] = None) -> dict:
-    """シートの内容を読み取る"""
+    """シートの内容を読み取る（max_row 省略時は最大 _DEFAULT_READ_ROWS 行まで）"""
     try:
         wb = _get_workbook(file_path)
         ws = wb[sheet_name] if sheet_name else wb.active
 
-        data = []
-        for row in ws.iter_rows(
-            min_row=min_row, max_row=max_row or ws.max_row,
-            min_col=min_col, max_col=max_col or ws.max_column
-        ):
-            row_data = []
-            for cell in row:
-                row_data.append({
-                    "address": cell.coordinate,
-                    "value": _cell_value(cell)
-                })
-            data.append(row_data)
+        # 巨大なシートを一度に返してコンテキストを溢れさせないよう上限を設ける
+        last_row = max_row or min(ws.max_row, min_row + _DEFAULT_READ_ROWS - 1)
+        last_col = max_col or ws.max_column
 
-        # テーブル形式の文字列も生成
-        table_lines = []
-        for row in data:
-            table_lines.append(" | ".join(
-                str(c["value"]) if c["value"] is not None else ""
-                for c in row
+        # セルごとにアドレスを付けるとトークンが膨らむため、列名と行番号で表す
+        rows = [
+            {"row": min_row + i, "values": [_cell_value(c) for c in row]}
+            for i, row in enumerate(ws.iter_rows(
+                min_row=min_row, max_row=last_row,
+                min_col=min_col, max_col=last_col,
             ))
-        table_str = "\n".join(table_lines)
+        ]
 
-        return {
+        result = {
             "success": True,
             "sheet": ws.title,
             "dimensions": ws.dimensions,
             "max_row": ws.max_row,
             "max_column": ws.max_column,
-            "data": data,
-            "table": table_str
+            "columns": [get_column_letter(c) for c in range(min_col, last_col + 1)],
+            "rows": rows,
         }
+        if last_row < ws.max_row:
+            result["truncated"] = True
+            result["next_min_row"] = last_row + 1
+        return result
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -157,7 +188,6 @@ def read_cell(file_path: str, cell_address: str,
             "sheet": ws.title
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -168,13 +198,12 @@ def write_cell(file_path: str, cell_address: str, value: Any,
         wb = _get_workbook(file_path, create_if_missing=True)
         ws = wb[sheet_name] if sheet_name else wb.active
         ws[cell_address.upper()] = value
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {
             "success": True,
             "message": f"{ws.title}!{cell_address.upper()} に '{value}' を書き込みました"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -183,6 +212,11 @@ def write_range(file_path: str, start_cell: str, data: list[list],
                 create_if_missing: bool = True) -> dict:
     """開始セルから2次元配列データを書き込む（例: start_cell='A1', data=[[1,2],[3,4]]）"""
     try:
+        if not isinstance(data, list) or not data:
+            return {"success": False, "error": "data には空でない2次元配列を指定してください"}
+        # 1次元で渡された行は1セルの行として扱う（文字列が1文字ずつ分解されるのを防ぐ）
+        rows = [r if isinstance(r, list) else [r] for r in data]
+
         wb = _get_workbook(file_path, create_if_missing=create_if_missing)
         ws = wb[sheet_name] if sheet_name else wb.active
 
@@ -192,19 +226,19 @@ def write_range(file_path: str, start_cell: str, data: list[list],
         start_col = start.column
 
         written = 0
-        for r_idx, row in enumerate(data):
+        for r_idx, row in enumerate(rows):
             for c_idx, val in enumerate(row):
                 ws.cell(row=start_row + r_idx, column=start_col + c_idx, value=val)
                 written += 1
 
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
+        last_col = start_col + max(max(len(r) for r in rows), 1) - 1
         return {
             "success": True,
             "message": f"{written}個のセルにデータを書き込みました",
-            "range": f"{start_cell.upper()}:{get_column_letter(start_col + max(len(r) for r in data) - 1)}{start_row + len(data) - 1}"
+            "range": f"{start_cell.upper()}:{get_column_letter(last_col)}{start_row + len(rows) - 1}"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -217,13 +251,12 @@ def apply_formula(file_path: str, cell_address: str, formula: str,
         if not formula.startswith("="):
             formula = "=" + formula
         ws[cell_address.upper()] = formula
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {
             "success": True,
             "message": f"{ws.title}!{cell_address.upper()} に数式 '{formula}' を設定しました"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -234,15 +267,14 @@ def create_sheet(file_path: str, sheet_name: str,
         wb = _get_workbook(file_path, create_if_missing=True)
         if sheet_name in wb.sheetnames:
             return {"success": False, "error": f"シート '{sheet_name}' は既に存在します"}
-        ws = wb.create_sheet(title=sheet_name, index=position)
-        wb.save(os.path.abspath(file_path))
+        wb.create_sheet(title=sheet_name, index=position)
+        _save(file_path, wb)
         return {
             "success": True,
             "message": f"シート '{sheet_name}' を作成しました",
             "sheets": wb.sheetnames
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -255,14 +287,13 @@ def delete_sheet(file_path: str, sheet_name: str) -> dict:
         if len(wb.sheetnames) == 1:
             return {"success": False, "error": "最後のシートは削除できません"}
         del wb[sheet_name]
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {
             "success": True,
             "message": f"シート '{sheet_name}' を削除しました",
             "sheets": wb.sheetnames
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -277,54 +308,15 @@ def format_cell(file_path: str, cell_address: str,
                 sheet_name: Optional[str] = None) -> dict:
     """セルの書式を設定する（色はHEX形式: 'FF0000' = 赤）"""
     try:
-        wb = _get_workbook(file_path)
-        ws = wb[sheet_name] if sheet_name else wb.active
-        cell = ws[cell_address.upper()]
-
-        # フォント設定
-        font_kwargs = {}
-        if bold is not None:
-            font_kwargs["bold"] = bold
-        if italic is not None:
-            font_kwargs["italic"] = italic
-        if font_size is not None:
-            font_kwargs["size"] = font_size
-        if font_color is not None:
-            font_kwargs["color"] = _validate_hex_color(font_color, "font_color")
-        if font_kwargs:
-            # 既存フォントを引き継ぎながら更新
-            existing = cell.font
-            cell.font = Font(
-                bold=font_kwargs.get("bold", existing.bold),
-                italic=font_kwargs.get("italic", existing.italic),
-                size=font_kwargs.get("size", existing.size),
-                color=font_kwargs.get("color", (existing.color.rgb if existing.color and existing.color.type == "rgb" else "000000"))
-            )
-
-        # 背景色
-        if bg_color is not None:
-            cell.fill = PatternFill(
-                fill_type="solid",
-                fgColor=_validate_hex_color(bg_color, "bg_color")
-            )
-
-        # 水平配置
-        if horizontal_align is not None:
-            if horizontal_align not in _VALID_ALIGN:
-                raise ValueError(f"horizontal_align は {_VALID_ALIGN} のいずれかを指定してください")
-            cell.alignment = Alignment(horizontal=horizontal_align)
-
-        # 数値書式
-        if number_format is not None:
-            cell.number_format = number_format
-
-        wb.save(os.path.abspath(file_path))
+        _format_cells(file_path, cell_address.upper(), sheet_name,
+                      bold=bold, italic=italic, font_size=font_size,
+                      font_color=font_color, bg_color=bg_color,
+                      horizontal_align=horizontal_align, number_format=number_format)
         return {
             "success": True,
             "message": f"{cell_address.upper()} の書式を更新しました"
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -336,10 +328,9 @@ def set_column_width(file_path: str, column: str, width: float,
         ws = wb[sheet_name] if sheet_name else wb.active
         col_letter = column.upper() if not column.isdigit() else get_column_letter(int(column))
         ws.column_dimensions[col_letter].width = width
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"列 {col_letter} の幅を {width} に設定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -347,14 +338,16 @@ def save_excel(file_path: str, save_as: Optional[str] = None) -> dict:
     """ファイルを保存する（save_as を指定すると別名保存）"""
     try:
         wb = _get_workbook(file_path)
-        target = os.path.abspath(save_as if save_as else file_path)
-        wb.save(target)
         if save_as:
-            # 新しいパスでもキャッシュ登録
-            _workbook_cache[target] = wb
+            # 別名保存先も作業ディレクトリ内に限定する。
+            # 同じオブジェクトを2つのパスで共有しないよう、次回はディスクから読み直す
+            target = safe_path(save_as)
+            wb.save(target)
+            _cache.evict(save_as)
+        else:
+            target = _save(file_path, wb)
         return {"success": True, "message": f"'{target}' に保存しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -372,7 +365,6 @@ def get_sheet_info(file_path: str, sheet_name: Optional[str] = None) -> dict:
             "all_sheets": wb.sheetnames
         }
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -387,40 +379,13 @@ def format_range(file_path: str, cell_range: str,
                  sheet_name: Optional[str] = None) -> dict:
     """セル範囲に書式を一括適用する（例: cell_range='A1:D1'）"""
     try:
-        wb = _get_workbook(file_path)
-        ws = wb[sheet_name] if sheet_name else wb.active
-
-        validated_font_color = _validate_hex_color(font_color, "font_color") if font_color else None
-        validated_bg_color   = _validate_hex_color(bg_color,   "bg_color")   if bg_color   else None
-
-        if horizontal_align and horizontal_align not in _VALID_ALIGN:
-            raise ValueError(f"horizontal_align は {_VALID_ALIGN} のいずれかを指定してください")
-
-        cells_updated = 0
-        for row in ws[cell_range]:
-            for cell in (row if hasattr(row, "__iter__") else [row]):
-                if any(v is not None for v in [bold, italic, font_size, validated_font_color]):
-                    existing = cell.font
-                    cell.font = Font(
-                        bold=bold if bold is not None else existing.bold,
-                        italic=italic if italic is not None else existing.italic,
-                        size=font_size if font_size is not None else existing.size,
-                        color=validated_font_color if validated_font_color else (
-                            existing.color.rgb if existing.color and existing.color.type == "rgb" else "000000"
-                        ),
-                    )
-                if validated_bg_color is not None:
-                    cell.fill = PatternFill(fill_type="solid", fgColor=validated_bg_color)
-                if horizontal_align is not None:
-                    cell.alignment = Alignment(horizontal=horizontal_align)
-                if number_format is not None:
-                    cell.number_format = number_format
-                cells_updated += 1
-
-        wb.save(os.path.abspath(file_path))
+        cells_updated = _format_cells(
+            file_path, cell_range.upper(), sheet_name,
+            bold=bold, italic=italic, font_size=font_size,
+            font_color=font_color, bg_color=bg_color,
+            horizontal_align=horizontal_align, number_format=number_format)
         return {"success": True, "message": f"{cell_range} の {cells_updated} セルに書式を適用しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -437,10 +402,9 @@ def merge_cells(file_path: str, cell_range: str,
         else:
             ws.merge_cells(cell_range)
             action = "結合"
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"{cell_range} のセルを{action}しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -460,14 +424,12 @@ def add_chart(file_path: str, chart_type: str,
         wb = _get_workbook(file_path)
         ws = wb[sheet_name] if sheet_name else wb.active
 
-        cells = list(ws[data_range])
-        if not cells:
-            return {"success": False, "error": f"データ範囲 {data_range} が空です"}
-
-        min_row = cells[0][0].row
-        max_row = cells[-1][0].row
-        min_col = cells[0][0].column
-        max_col = cells[0][-1].column
+        min_col, min_row, max_col, max_row = range_boundaries(data_range.upper())
+        if None in (min_col, min_row, max_col, max_row) or max_row <= min_row:
+            return {"success": False,
+                    "error": f"データ範囲 {data_range} が不正です。ヘッダー行を含めて 'A1:B6' の形式で2行以上指定してください"}
+        # 1列だけ指定された場合はカテゴリなしで、その列を数値データとして扱う
+        has_categories = max_col > min_col
 
         ct = chart_type.lower()
         if ct in ("bar", "棒"):
@@ -481,24 +443,24 @@ def add_chart(file_path: str, chart_type: str,
 
         # 数値データ列（2列目以降）を参照。先頭行をシリーズ名として使用
         data_ref = Reference(ws,
-                             min_col=min_col + 1, max_col=max_col,
+                             min_col=min_col + 1 if has_categories else min_col, max_col=max_col,
                              min_row=min_row, max_row=max_row)
         chart.add_data(data_ref, titles_from_data=True)
 
         # 先頭列（カテゴリラベル）をX軸に設定。ヘッダー行は除く
-        cats_ref = Reference(ws,
-                             min_col=min_col,
-                             min_row=min_row + 1, max_row=max_row)
-        chart.set_categories(cats_ref)
+        if has_categories:
+            cats_ref = Reference(ws,
+                                 min_col=min_col,
+                                 min_row=min_row + 1, max_row=max_row)
+            chart.set_categories(cats_ref)
 
         if title:
             chart.title = title
 
         ws.add_chart(chart, position.upper())
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"{chart_type} グラフを {position.upper()} に追加しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -509,10 +471,9 @@ def freeze_panes(file_path: str, cell: str,
         wb = _get_workbook(file_path)
         ws = wb[sheet_name] if sheet_name else wb.active
         ws.freeze_panes = cell.upper()
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"ウィンドウ枠を {cell.upper()} で固定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -523,10 +484,9 @@ def set_row_height(file_path: str, row: int, height: float,
         wb = _get_workbook(file_path)
         ws = wb[sheet_name] if sheet_name else wb.active
         ws.row_dimensions[row].height = height
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"行 {row} の高さを {height} に設定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -537,10 +497,9 @@ def add_filter(file_path: str, cell_range: str,
         wb = _get_workbook(file_path)
         ws = wb[sheet_name] if sheet_name else wb.active
         ws.auto_filter.ref = cell_range
-        wb.save(os.path.abspath(file_path))
+        _save(file_path, wb)
         return {"success": True, "message": f"{cell_range} にオートフィルターを設定しました"}
     except Exception as e:
-        _reraise_if_fatal(e)
         return {"success": False, "error": str(e)}
 
 
@@ -573,10 +532,13 @@ TOOLS = [
     {
         "name": "read_sheet",
         "description": (
-            "Read the contents of a sheet. "
+            "Read the contents of a sheet. Returns 'columns' (column letters) and 'rows' "
+            "(each with its row number and cell values). "
             "For large sheets (100+ rows), always read in chunks using min_row/max_row "
             "to avoid exceeding context limits. "
             "Example: first call with min_row=1, max_row=50, then min_row=51, max_row=100, and so on. "
+            "If max_row is omitted, at most 100 rows are returned; when 'truncated' is true, "
+            "continue from 'next_min_row'. "
             "Use get_sheet_info first to know the total row count."
         ),
         "input_schema": {
@@ -585,7 +547,7 @@ TOOLS = [
                 "file_path": {"type": "string", "description": "Path to the Excel file"},
                 "sheet_name": {"type": "string", "description": "Sheet name (defaults to active sheet)"},
                 "min_row": {"type": "integer", "description": "First row to read (default: 1). Use for chunked reading of large files."},
-                "max_row": {"type": "integer", "description": "Last row to read (default: last row). Set explicitly to limit chunk size."},
+                "max_row": {"type": "integer", "description": "Last row to read (default: min_row + 99). Set explicitly to control chunk size."},
                 "min_col": {"type": "integer", "description": "First column to read (default: 1)"},
                 "max_col": {"type": "integer", "description": "Last column to read (default: last column)"}
             },
@@ -852,8 +814,4 @@ TOOL_FUNCTIONS = {
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     """ツールを実行してJSON文字列で結果を返す"""
-    func = TOOL_FUNCTIONS.get(tool_name)
-    if not func:
-        return json.dumps({"success": False, "error": f"不明なツール: {tool_name}"}, ensure_ascii=False)
-    result = func(**tool_input)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return run_tool(TOOL_FUNCTIONS, tool_name, tool_input, cache=_cache)
