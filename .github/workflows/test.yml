@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml の requires-python の下限と、手元で使っている版
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0  # setup-uv はメジャーバージョンのタグ (v10) を公開していない
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      # uv.lock が pyproject.toml と食い違っていたら失敗させる（Dependabot の更新漏れ検出）
+      - run: uv lock --check
+      - run: uv sync --frozen
+      - run: uv run --frozen pytest
