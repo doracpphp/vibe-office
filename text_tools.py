@@ -109,11 +109,44 @@ def _parse_table(lines: list[str]) -> Optional[dict]:
     return {"type": "table", "headers": headers, "rows": rows}
 
 
+# バックスラッシュエスケープ（\*）とコードスパン（`code`）の中身は書式記号として扱わない
+_LITERAL_RE = re.compile(r'\\([!-/:-@\[-`{-~])|(?<!`)(`+)(?!`)(.+?)(?<!`)\2(?!`)')
+# [テキスト](URL) / ![代替テキスト](画像) はテキスト部分だけ残す
+_LINK_RE = re.compile(r'!?\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)')
+# * は単語の途中でも強調になるが、_ は単語の切れ目にあるときだけ（file_name_here 対策）。
+# どちらも記号のすぐ内側が空白なら強調にしない（2 * 3 * 4 対策）
+_EMPHASIS_RE = re.compile(
+    r'(?P<star>\*{1,3})(?![\s*])(?P<star_text>.+?)(?<![\s*])(?P=star)(?!\*)'
+    r'|(?<!\w)(?P<under>_{1,3})(?![\s_])(?P<under_text>.+?)(?<![\s_])(?P=under)(?!\w)'
+)
+# 退避したエスケープ・コードの中身は Unicode 私用領域の文字に置き換えておく
+_PLACEHOLDER_BASE = 0xF0000
+
+
+def _parse_emphasis(text: str, bold: bool, italic: bool) -> list[dict]:
+    runs: list[dict] = []
+    pos = 0
+    for m in _EMPHASIS_RE.finditer(text):
+        if m.start() > pos:
+            runs.append({"text": text[pos:m.start()], "bold": bold, "italic": italic})
+        if m.group("star"):
+            delim, inner = m.group("star", "star_text")
+        else:
+            delim, inner = m.group("under", "under_text")
+        # 内側の強調（**太字 *斜体* 太字**）も外側の書式を引き継いで解析する
+        runs.extend(_parse_emphasis(inner, bold or len(delim) >= 2, italic or len(delim) != 2))
+        pos = m.end()
+    if pos < len(text):
+        runs.append({"text": text[pos:], "bold": bold, "italic": italic})
+    return runs
+
+
 def parse_inline_formatting(text: str) -> list[dict]:
     """
     テキスト内の **bold** / *italic* / ***bold-italic*** を解析してランリストを返す。
     各ランは {"text": str, "bold": bool, "italic": bool} の辞書。
     Word の append_rich_paragraph に渡すことで書式付き段落を作れる。
+    `code` は記号を外した書式なしのテキスト、[テキスト](URL) はテキスト部分だけになる。
 
     例:
       "Hello **world** and *foo*"
@@ -122,23 +155,32 @@ def parse_inline_formatting(text: str) -> list[dict]:
          {"text":" and ","bold":False,"italic":False},
          {"text":"foo","bold":False,"italic":True}]
     """
+    literals: list[str] = []
+
+    def stash(m: re.Match) -> str:
+        if m.group(1) is not None:
+            literal = m.group(1)
+        else:
+            literal = m.group(3)
+            # CommonMark と同様に両端の空白を1つずつ除く（`` `x` `` のような書き方のため）
+            if len(literal) >= 2 and literal[0] == literal[-1] == " " and literal.strip():
+                literal = literal[1:-1]
+        literals.append(literal)
+        return chr(_PLACEHOLDER_BASE + len(literals) - 1)
+
+    masked = _LINK_RE.sub(r'\1', _LITERAL_RE.sub(stash, text))
+    restore = {_PLACEHOLDER_BASE + i: literal for i, literal in enumerate(literals)}
+
     runs: list[dict] = []
-    # ***bold-italic*** > **bold** > *italic* の順にマッチ
-    pattern = re.compile(r'(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|_(.+?)_)')
-    pos = 0
-    for m in pattern.finditer(text):
-        if m.start() > pos:
-            runs.append({"text": text[pos:m.start()], "bold": False, "italic": False})
-        raw = m.group(0)
-        inner = m.group(2) or m.group(3) or m.group(4) or m.group(5) or m.group(6) or ""
-        bold   = raw.startswith("***") or raw.startswith("**") or raw.startswith("__")
-        italic = raw.startswith("***") or (raw.startswith("*") and not raw.startswith("**")) \
-                 or (raw.startswith("_") and not raw.startswith("__"))
-        runs.append({"text": inner, "bold": bold, "italic": italic})
-        pos = m.end()
-    if pos < len(text):
-        runs.append({"text": text[pos:], "bold": False, "italic": False})
-    return runs or [{"text": text, "bold": False, "italic": False}]
+    for run in _parse_emphasis(masked, False, False):
+        run["text"] = run["text"].translate(restore)
+        if not run["text"]:
+            continue
+        if runs and (runs[-1]["bold"], runs[-1]["italic"]) == (run["bold"], run["italic"]):
+            runs[-1]["text"] += run["text"]
+        else:
+            runs.append(run)
+    return runs or [{"text": "", "bold": False, "italic": False}]
 
 
 _HEADING_RE = re.compile(r'^(#{1,6})\s+(.*)')
@@ -252,6 +294,7 @@ TOOLS = [
         "description": (
             "Parse inline Markdown formatting (**bold**, *italic*, ***bold-italic***) "
             "in a text string and return {'runs': [...]} with bold/italic flags per run. "
+            "Inline `code` becomes plain text and [text](url) links keep only the text. "
             "Pass the result to append_rich_paragraph to write formatted text into Word."
         ),
         "input_schema": {
