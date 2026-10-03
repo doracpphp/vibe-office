@@ -211,7 +211,8 @@ claude mcp add vibe-office -e VIBE_OFFICE_WORKDIR=/path/to/documents -- uv run -
 ## テストの実行
 
 ```bash
-uv run pytest
+uv run pytest      # テスト（MCP サーバーの起動確認を含む）
+uv run ruff check  # コードチェック
 ```
 
 ## プロジェクト構成

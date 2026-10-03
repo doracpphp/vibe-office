@@ -211,7 +211,8 @@ The agent can only read and write files inside the current working directory (th
 ## Running tests
 
 ```bash
-uv run pytest
+uv run pytest      # tests (including an MCP server smoke test)
+uv run ruff check  # lint
 ```
 
 ## Project structure

@@ -27,4 +27,5 @@ jobs:
       # uv.lock が pyproject.toml と食い違っていたら失敗させる（Dependabot の更新漏れ検出）
       - run: uv lock --check
       - run: uv sync --frozen
+      - run: uv run --frozen ruff check
       - run: uv run --frozen pytest

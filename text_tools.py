@@ -105,7 +105,7 @@ def _parse_table(lines: list[str]) -> Optional[dict]:
         return [c.strip() for c in line.strip().strip("|").split("|")]
 
     headers = split_row(lines[0])
-    rows = [split_row(l) for l in lines[2:] if l.strip()]
+    rows = [split_row(line) for line in lines[2:] if line.strip()]
     return {"type": "table", "headers": headers, "rows": rows}
 
 
