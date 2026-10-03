@@ -17,11 +17,31 @@ def safe_path(file_path: str) -> str:
     """
     base_dir = os.path.realpath(os.getcwd())
     abs_path = os.path.realpath(os.path.join(base_dir, file_path))
-    if os.path.commonpath([base_dir, abs_path]) != base_dir:
+    try:
+        inside = os.path.commonpath([base_dir, abs_path]) == base_dir
+    except ValueError:
+        # Windows で別のドライブ（例: D:\）が指定された場合
+        inside = False
+    if not inside:
         raise PermissionError(
             f"アクセス拒否: 作業ディレクトリ外のパスは操作できません: {abs_path}"
         )
     return abs_path
+
+
+def save_file(obj: Any, abs_path: str) -> None:
+    """Workbook / Document を保存する。
+
+    Windows では Excel / Word で開いているファイルに書き込めないため、
+    その場合は対処方法が分かるメッセージに置き換える。
+    """
+    try:
+        obj.save(abs_path)
+    except PermissionError as e:
+        raise PermissionError(
+            f"ファイルに書き込めません: {abs_path}"
+            "（Excel / Word で開いている場合は閉じてから再実行してください）"
+        ) from e
 
 
 def validate_hex_color(value: str, name: str) -> str:
@@ -68,7 +88,7 @@ class FileCache:
 
     def save(self, file_path: str, obj: Any) -> str:
         abs_path = safe_path(file_path)
-        obj.save(abs_path)
+        save_file(obj, abs_path)
         self._entries[abs_path] = (obj, _mtime(abs_path))
         return abs_path
 

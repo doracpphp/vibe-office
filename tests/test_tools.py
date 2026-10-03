@@ -2,7 +2,8 @@
 import datetime
 import json
 import os
-import signal
+import stat
+import threading
 
 import openpyxl
 import pytest
@@ -11,6 +12,7 @@ from docx.oxml.ns import qn
 from openpyxl.styles import Font
 
 import agent
+import main
 import text_tools
 
 
@@ -48,6 +50,42 @@ def test_save_as_outside_workdir_is_rejected(workdir):
     run("append_paragraph", file_path="a.docx", text="x")
     assert run("save_word", file_path="a.docx", save_as="../escaped.docx")["success"] is False
     assert not (workdir.parent / "escaped.docx").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="ドライブ文字は Windows のみ")
+def test_other_drive_is_rejected(workdir):
+    drive = os.path.splitdrive(str(workdir))[0].upper()
+    other = "C:" if drive == "D:" else "D:"
+    result = run("write_cell", file_path=other + "\\x.xlsx", cell_address="A1", value=1)
+    assert result["success"] is False
+    assert "作業ディレクトリ外" in result["error"]
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root は読み取り専用ファイルにも書き込めてしまう")
+def test_save_to_locked_file_explains_how_to_fix(workdir):
+    run("write_cell", file_path="lock.xlsx", cell_address="A1", value=1)
+    run("append_paragraph", file_path="lock.docx", text="x")
+    (workdir / "copy.docx").write_bytes(b"")
+    # Excel / Word で開いている状態の代わりに、読み取り専用にして書き込みを失敗させる
+    locked = [workdir / "lock.xlsx", workdir / "copy.docx"]
+    for path in locked:
+        path.chmod(stat.S_IREAD)
+    try:
+        results = [
+            run("write_cell", file_path="lock.xlsx", cell_address="A1", value=2),
+            run("save_word", file_path="lock.docx", save_as="copy.docx"),
+        ]
+    finally:
+        for path in locked:
+            path.chmod(stat.S_IREAD | stat.S_IWRITE)
+    for result in results:
+        assert result["success"] is False
+        assert "閉じてから" in result["error"]
+
+
+def test_enable_ansi_colors_does_not_fail():
+    main.enable_ansi_colors()
 
 
 def test_workdir_follows_cwd_change(workdir, monkeypatch):
@@ -253,25 +291,25 @@ def test_insert_image_outside_workdir_is_rejected():
 
 # ── テキスト / Markdown ───────────────────────────────────────────────────────
 
-@pytest.fixture
-def timeout():
-    def handler(*_):
-        raise TimeoutError("無限ループ")
-    signal.signal(signal.SIGALRM, handler)
-    signal.alarm(2)
-    yield
-    signal.alarm(0)
+def run_with_timeout(func, *args, seconds=2):
+    """func が終わらなければ失敗にする（無限ループの検出用。Windows でも動くようスレッドで待つ）"""
+    result = []
+    thread = threading.Thread(target=lambda: result.append(func(*args)), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "無限ループ"
+    return result[0]
 
 
-def test_parse_markdown_hash_without_space(workdir, timeout):
-    (workdir / "h.md").write_text("#tag\n本文\n####### seven\n")
-    result = text_tools.parse_markdown("h.md")
+def test_parse_markdown_hash_without_space(workdir):
+    (workdir / "h.md").write_text("#tag\n本文\n####### seven\n", encoding="utf-8")
+    result = run_with_timeout(text_tools.parse_markdown, "h.md")
     assert result["success"] is True
     assert result["blocks"][0]["type"] == "paragraph"
 
 
 def test_parse_markdown_list_keeps_inner_numbers(workdir):
-    (workdir / "l.md").write_text("- see section 3. details\n1. step 2. again\n")
+    (workdir / "l.md").write_text("- see section 3. details\n1. step 2. again\n", encoding="utf-8")
     items = text_tools.parse_markdown("l.md")["blocks"][0]["items"]
     assert items == ["see section 3. details", "step 2. again"]
 
