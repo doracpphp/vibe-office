@@ -41,6 +41,21 @@ SHOW_CURSOR = "\033[?25h"
 CLEAR_LINE  = "\033[2K\r"
 
 
+def enable_ansi_colors() -> None:
+    """Windows の従来のコンソール（conhost）でも ANSI エスケープシーケンスを解釈させる。
+
+    Windows Terminal では最初から有効なので影響しない。
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
 class Spinner:
     """AIが処理中であることを示すスピナー"""
 
@@ -264,6 +279,7 @@ def parse_args():
 
 
 def main():
+    enable_ansi_colors()
     # スクリプトと同じディレクトリの .env を読み込む（--provider などの既定値にも使うため最初に行う）
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
     args = parse_args()

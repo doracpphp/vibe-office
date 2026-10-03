@@ -9,7 +9,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter, range_boundaries
 
-from common import FileCache, run_tool, safe_path, validate_hex_color
+from common import FileCache, run_tool, safe_path, save_file, validate_hex_color
 
 
 _VALID_ALIGN = {"left", "center", "right"}
@@ -342,7 +342,7 @@ def save_excel(file_path: str, save_as: Optional[str] = None) -> dict:
             # 別名保存先も作業ディレクトリ内に限定する。
             # 同じオブジェクトを2つのパスで共有しないよう、次回はディスクから読み直す
             target = safe_path(save_as)
-            wb.save(target)
+            save_file(wb, target)
             _cache.evict(save_as)
         else:
             target = _save(file_path, wb)

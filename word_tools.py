@@ -10,7 +10,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-from common import FileCache, run_tool, safe_path, validate_hex_color
+from common import FileCache, run_tool, safe_path, save_file, validate_hex_color
 
 
 # 現在開いているドキュメントのキャッシュ
@@ -499,7 +499,7 @@ def save_word(file_path: str, save_as: Optional[str] = None) -> dict:
             # 別名保存先も作業ディレクトリ内に限定する。
             # 同じオブジェクトを2つのパスで共有しないよう、次回はディスクから読み直す
             target = safe_path(save_as)
-            doc.save(target)
+            save_file(doc, target)
             _cache.evict(save_as)
         else:
             target = _save(file_path)

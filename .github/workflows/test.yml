@@ -10,10 +10,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # Excel / Word の利用者が多い Windows でも確認する
+        os: [ubuntu-latest, windows-latest]
         # pyproject.toml の requires-python の下限と、手元で使っている版
         python-version: ["3.11", "3.13"]
     steps:
